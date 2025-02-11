@@ -1,6 +1,10 @@
 services:
-  fastapi:
-    build: .
+  api:
+    hostname: api-predict
+    image: fastapi
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     ports:
       - "8000:8000"
     volumes:
