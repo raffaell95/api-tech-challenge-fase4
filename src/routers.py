@@ -1,160 +1,79 @@
-from typing import List
-from fastapi import APIRouter, status, Depends
-from fastapi import Depends, status, APIRouter, HTTPException
-from sqlalchemy.orm import Session
-from infra.config.database import get_db, criar_bd
-from infra.repositories import RepositoryUData, RepositoryUItem
-import aiohttp
-import zipfile
+from fastapi import APIRouter, status
+from fastapi import status, APIRouter
+import tensorflow as tf
+import yfinance as yf
+import numpy as np
+import pandas as pd
 import os
-from io import BytesIO
-from schemas.schemas import UDataSchema, UItemSchema
-
+from sklearn.preprocessing import MinMaxScaler
+from src.schemas.schemas import FinancyDataSchema
 
 router = APIRouter()
 
-ZIP_URL = "https://files.grouplens.org/datasets/movielens/ml-100k.zip"
-DEST_DIR = "ml-100k"  # Diretório onde o conteúdo será extraído
 
-@router.on_event("startup")
-async def startup():
-    # Criar banco de dados
-
-    # Criar diretório se não existir
-    if not os.path.exists(DEST_DIR):
-        os.makedirs(DEST_DIR)
-
-@router.post('/baixar/arquivo/movielens', status_code=status.HTTP_201_CREATED)
-async def baixar_arquivo():
-    try:
-        # Baixando o arquivo zip
-        async with aiohttp.ClientSession() as session:
-            async with session.get(ZIP_URL) as response:
-                if response.status != 200:
-                    return {"erro": "Falha ao baixar o arquivo", "status": response.status}
-
-                # Lendo o conteúdo do arquivo zip diretamente da resposta
-                zip_content = await response.read()
-                
-                # Descompactando o arquivo zip
-                with zipfile.ZipFile(BytesIO(zip_content)) as zf:
-                    zf.extractall(DEST_DIR)
-
-                return {"status": "sucesso", "mensagem": "Arquivo descompactado com sucesso!", "diretorio": DEST_DIR}
-
-    except Exception as e:
-        return {"erro": str(e)}
-
-
-@router.post('/salvar/udata', status_code=status.HTTP_201_CREATED)
-async def salvar_udata(session: Session =  Depends(get_db)):
-
-    file_path = '/home/raffa/Documentos/api-tech-challenge-fase3/ml-100k/ml-100k/u.data'
-    
-    # Verifique se o arquivo existe antes de tentar abrir
-    if not os.path.exists(file_path):
-        return {"error": "Arquivo não encontrado"}
+@router.post('/api/v1/predict',
+             summary="Realizar predição de valores",
+             description="""Realizar predição de valores, usando como base biblioteca yFinance \n
+             exemplo: {
+                     "symbol": "DIS",
+                     "start_date": "2023-02-11",
+                     "end_date": "2025-02-11"
+                    }""",
+             status_code=status.HTTP_201_CREATED)
+def predict(data: FinancyDataSchema):
 
     try:
-        # Abra o arquivo e leia as linhas
-        with open(file_path, 'r') as file:
-            lines = file.readlines()
+        # Baixar dados financeiros
+ 
+        df = yf.download(data.symbol, start=data.start_date, end=data.end_date)
 
-        data: List[UDataSchema] = []
-        for i, line in enumerate(lines):
+        # Buscando o Caminho do arquivo
+        model_path = os.path.join(os.getcwd(), "LSTMTrained", "LSTM-TrainedModel.h5")
+        
+        # Carregar o modelo treinado
+        model = tf.keras.models.load_model(model_path)
 
-            # if i >= 10:
-            #     break  # Sai do loop após processar 10 linhas
+        # Selecionar a coluna que você quer prever, por exemplo, "Close"
+        data_for_forecast = df[['Close']]  # Ajuste conforme as colunas que seu modelo espera
+        
+        # Normalizar os dados (supondo que o modelo tenha sido treinado com dados normalizados)
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        normalized_data = scaler.fit_transform(data_for_forecast)
 
-            parts = line.strip().split('\t')
-            
-            if len(parts) == 4:
-                user_id, item_id, rating, timestamp = parts
-                data.append(UDataSchema(user_id=user_id, item_id=item_id, rating=rating, timestamp=timestamp))
+        # Preparar os dados para a entrada LSTM (reshape para [amostras, passos_de_tempo, características])
+        time_steps = 60  # Ajuste conforme o que o seu modelo espera
+        X = []
 
+        for i in range(time_steps, len(normalized_data)):
+            X.append(normalized_data[i - time_steps:i, 0])
 
-        repository = RepositoryUData(session).save(data)
+        X = np.array(X)
+        X = np.reshape(X, (X.shape[0], X.shape[1], 1))  # Garantir que os dados têm 3D como o LSTM espera
+        
+        # Fazer previsões
+        forecasts = model.predict(X)
+        
+        # Desnormalizar as previsões para o valor original
+        denormalized_predictions = scaler.inverse_transform(forecasts)
+        
 
-        # Retornar os dados processados
-        return {"data": repository}
+        # Preparar os dados para enviar no formato JSON
+        results = []
+        for i in range(len(denormalized_predictions)):
+            results.append({
+                "index": i,
+                "data": df.index[i + time_steps].strftime('%Y-%m-%d'),  # Data da previsão
+                "valor_real": data_for_forecast.iloc[i + time_steps].values[0],  # Valor real
+                "previsao": float(denormalized_predictions[i][0]) # Valor previsto
+            })
 
-    except Exception as e:
-        return {"error": f"Ocorreu um erro ao ler o arquivo: {str(e)}"}
-    
-
-@router.get('/listar/udata', status_code=status.HTTP_200_OK)
-async def listar_udata(session: Session =  Depends(get_db)):
-    udata = RepositoryUData(session).list()
-    return udata
-
-
-@router.post('/salvar/uitem', status_code=status.HTTP_201_CREATED)
-async def salvar_uitem(session: Session =  Depends(get_db)):
-
-    file_path = '/home/raffa/Documentos/api-tech-challenge-fase3/ml-100k/ml-100k/u.item'
-    
-    # Verifique se o arquivo existe antes de tentar abrir
-    if not os.path.exists(file_path):
-        return {"error": "Arquivo não encontrado"}
-
-    try:
-        # Abra o arquivo e leia as linhas
-        with open(file_path, 'r', encoding="ISO-8859-1") as file:
-            lines = file.readlines()
-            print(lines)
-
-        data: List[UItemSchema] = []
-        for i, line in enumerate(lines):
-
-            # if i >= 10:
-            #     break  # Sai do loop após processar 10 linhas
-
-            parts = line.strip().split('|')
-            
-            if len(parts) == 24:
-                movie_id, movie_title, release_date, video_release_date, imdb_url, unknown, \
-                action, adventure, animation, childrens, comedy, crime, documentary, drama, \
-                fantasy, film_noir, horror, musical, mystery, romance, sci_fi, thriller, war, \
-                western = parts
-                
-                data.append(UItemSchema(
-                    movie_id = movie_id,
-                    movie_title = movie_title,
-                    release_date = release_date,
-                    video_release_date = video_release_date,
-                    imdb_url = imdb_url,
-                    unknown = unknown,
-                    action = action,
-                    adventure = adventure,
-                    animation= animation,
-                    childrens = childrens,
-                    comedy = comedy,
-                    crime = crime,
-                    documentary = documentary,
-                    drama = drama,
-                    fantasy = fantasy,
-                    film_noir = film_noir,
-                    horror = horror,
-                    musical = musical,
-                    mystery = mystery,
-                    romance = romance,
-                    sci_fi = sci_fi,
-                    thriller = thriller,
-                    war = war,
-                    western = western
-                ))
-
-
-        repository = RepositoryUItem(session).save(data)
-
-        # Retornar os dados processados
-        return {"data": repository}
+        return {
+                "symbol": data.symbol,
+                "forecasts": results
+                }
 
     except Exception as e:
-        return {"error": f"Ocorreu um erro ao ler o arquivo: {str(e)}"}
+        return {"erro": f"Ocorreu um erro ao processar o modelo: {str(e)}"}
 
 
-@router.get('/listar/uitem', status_code=status.HTTP_200_OK)
-async def listar_uitem(session: Session =  Depends(get_db)):
-    uitem = RepositoryUItem(session).list()
-    return uitem
+    
